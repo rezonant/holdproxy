@@ -1,179 +1,111 @@
 require('source-map-support').install();
+
 import * as express from 'express';
 import { request as httpRequest } from 'http';
 import { ReplaySubject } from 'rxjs/ReplaySubject';
 import { Subscription } from 'rxjs/Subscription';
 import * as yaml from 'js-yaml';
 import * as fs from 'fs';
+import { Config, Holdproxy } from './holdproxy';
 
-let configFile = process.argv[2] || '/etc/holdproxy.yaml';
-let configSpecified = process.argv[2] ? true : false;
-let port = 7777;
-let upstream = "localhost:3000";
-let maxAttempts = 10;
-let delay = 5;
+/** 
+ * Additional config options and shortcuts which are only available 
+ * through the CLI
+ */
+interface CliConfig extends Config {
+    upstream? : string | number;
+}
 
-function configure() {
-    try {
-        let configDoc = yaml.load(fs.readFileSync(configFile, 'utf8'));
+export const DEFAULT_CONFIG = {
+    port: 3001,
+    upstream: 3000, 
+    maxAttempts: 10,
+    delay: 5,
+    upstreamHost: 'localhost',
+    upstreamPort: 3000
+};
 
-        if (!configDoc.holdproxy)
-            throw new Error("Top level object must be 'holdproxy'");
+class HoldproxyCommand {
+    /**
+     * Main function of the holdproxy command.
+     * @param args 
+     */
+    public static async main(args : string[]) {
+        let configFile = args[0] || '/etc/holdproxy.yaml';
+        let configSpecified = args[0] ? true : false;
+        let config = this.getConfig(configFile, configSpecified);
 
-        port = configDoc.holdproxy.port || port;
-        upstream = configDoc.holdproxy.upstream ? configDoc.holdproxy.upstream+"" : upstream; 
-        maxAttempts = configDoc.holdproxy.maxAttempts || maxAttempts;
-        delay = configDoc.holdproxy.delay || delay;
-    } catch (e) {
+        try {
+            await new Holdproxy(config).listen(() => {
+                console.log();
+                console.log(`holdproxy listening on port ${config.port}`)
+                console.log(` - configured from: ${configFile}`)
+                console.log(` - upstream: ${config.upstreamHost}:${config.upstreamPort}`);
+                console.log(` - max attempts: ${config.maxAttempts}`);
+                console.log(` - retry delay: ${config.delay}`);
+                console.log();
+            });
+        } catch (e) {
+            if (e['code'] == 'EADDRINUSE')
+                this.bail(`Error: The port ${config.port} is already in use.`);
 
-        if (e['code'] == 'ENOENT') {
-            if (configSpecified) {
-                console.error(configFile+': Configuration file not found');
-                process.exit(1);
+            console.error("Unhandled error:");
+            console.error(e);
+
+            this.bail(e.message);
+        }
+    }
+
+    private static bail(message : string, exitCode = 1) {
+        console.error(message);
+        process.exit(exitCode);
+    }
+
+    private static getConfig(configFile : string, required = false): CliConfig {
+        let config : CliConfig = null;
+        let rawConfig = {};
+
+        try {
+            let parsedConfig = yaml.load(fs.readFileSync(configFile, 'utf8'));
+            if (parsedConfig.holdproxy)
+                rawConfig = this.processConfig(parsedConfig.holdproxy);
+        } catch (e) {
+            if (e['code'] == 'ENOENT') {
+                if (required)
+                    this.bail(`${configFile}: Configuration file not found`);
+            } else {
+                this.bail(`Invalid configuration: ${e.message}`);
             }
-            return;
         }
 
-        console.error('Invalid configuration:');
-        console.error(e.message);
-        process.exit(1);
+        return Object.assign(DEFAULT_CONFIG, rawConfig);
+    }
+
+    private static processConfig(parsedConfig : CliConfig) {
+        if (parsedConfig.upstream) {
+            let upstreamHost;
+            let upstreamPort;
+            if (typeof parsedConfig.upstream === 'number') {
+                upstreamHost = 'localhost';
+                upstreamPort = parsedConfig.upstream;
+            } else if (parsedConfig.upstream.indexOf(':') > 0) {
+                let [ host, port ] = parsedConfig.upstream.split(/:/g, 2);
+                upstreamHost = host;
+                upstreamPort = parseInt(port);
+            } else if (/\d+/.test(parsedConfig.upstream)) {
+                upstreamPort = parseInt(parsedConfig.upstream);
+                upstreamHost = "localhost";
+            } else {
+                upstreamHost = parsedConfig.upstream;
+                upstreamPort = 80;
+            }
+
+            parsedConfig.upstreamHost = upstreamHost;
+            parsedConfig.upstreamPort = upstreamPort;
+        }
+
+        return parsedConfig;
     }
 }
 
-configure();
-
-let upstreamPort : number;
-let upstreamHost : string;
-
-if (upstream.indexOf(':') > 0) {
-    let [ host, port ] = upstream.split(/:/g, 2);
-    upstreamHost = host;
-    upstreamPort = parseInt(port);
-} else if (/\d+/.test(upstream)) {
-    upstreamPort = parseInt(upstream);
-    upstreamHost = "localhost";
-} else {
-    upstreamHost = upstream;
-    upstreamPort = 80;
-}
-
-let app = express()
-    .all('/*', (req, res) => {
-        let headers = {};
-
-        for (let i = 0, max = req.rawHeaders.length; i < max; i += 2) {
-            let key = req.rawHeaders[i];
-            let value = req.rawHeaders[i + 1];
-            headers[key] = value;
-        }
-
-        let params = {
-            hostname: upstreamHost,
-            port: upstreamPort,
-
-            headers,
-            path: req.path,
-            method: req.method
-        };
-
-        // ---- 
-
-        let requestBuffer = new ReplaySubject();
-        req.on('data', chunk => requestBuffer.next(chunk));
-        req.on('end', () => requestBuffer.next(null));
-
-        // ----
-
-        function doSubrequest(params, maxAttempts = 10, delay = 10, attempt = 1) {
-            let invalid = false;
-
-            let subrequest = httpRequest(params, (subresponse) => {
-                for (let i = 0, max = subresponse.rawHeaders.length; i < max; i += 2) {
-                    res.header(subresponse.rawHeaders[i], subresponse.rawHeaders[i+1]);
-                }
-
-                res.header('X-HoldProxy', `Attempt ${attempt}`);
-    
-                subresponse.on('data', chunk => res.write(chunk));
-                subresponse.on('end', () => {
-                    res.end();
-
-                    if (attempt > 1) {
-                        console.log(`${new Date()} | ${req.ip} | ${req.method} ${req.path} | ${subresponse.statusCode} | Recovered after ${attempt} attempts`);
-                    } else {
-                        console.log(`${new Date()} | ${req.ip} | ${req.method} ${req.path} | ${subresponse.statusCode}`);
-                    }
-                });
-            });
-
-            subrequest.on('error', e => {
-                if (e['code'] == 'ECONNREFUSED') {
-
-                    invalid = true;
-
-                    if (attempt < maxAttempts) {
-                        console.log(`${new Date()} | ${req.ip} | ${req.method} ${req.path} | upstream down, held for retry in ${delay} seconds`);
-                        setTimeout(() => {
-                            doSubrequest(params, maxAttempts, delay, attempt + 1);
-                        }, 1000 * delay);
-            
-                        return;
-                    }
-
-                    console.log(`${new Date()} | ${req.ip} | ${req.method} ${req.path} | still down after maximum (${maxAttempts}) attempts`);
-
-                    console.log('Failed to connect to upstream!');
-                    console.log(e);
-
-                    res.status(503);
-                    res.header('X-HoldProxy', `Failed after ${maxAttempts} attempts`);
-                    res.header('Content-Type', 'text/html');
-                    res.write("<html><body>holdproxy 503: Service unavailable</body></html>");
-                    res.end();
-
-                    console.log(`${new Date()} | ${req.ip} | ${req.method} ${req.path} | 503`);
-
-                } else {
-                    console.log('Error during request:');
-                    console.log(e);
-                    res.status(500);
-                    res.header('Content-Type', 'text/html');
-                    res.write("<html><body>holdproxy 500</body></html>");
-                    res.end();
-                }
-            })
-
-            !function() {
-                var subscription : Subscription;
-                subscription = requestBuffer.subscribe(chunk => {
-                    if (invalid) {
-                        subscription.unsubscribe();
-                        return;
-                    }
-
-                    if (chunk) {
-                        subrequest.write(chunk)
-                    } else {
-                        subrequest.end();
-                        if (subscription != null)
-                            subscription.unsubscribe();
-                        invalid = true;
-                    }
-                });
-
-                if (invalid)
-                    subscription.unsubscribe();
-            }();
-        }
-
-        doSubrequest(params, maxAttempts, delay);
-
-    })
-    .listen(port, () => {
-        console.log();
-        console.log(`holdproxy: listening on port ${port}, sending to upstream ${upstreamHost}:${upstreamPort}`);
-        console.log(` - max attempts: ${maxAttempts}`);
-        console.log(` - retry delay: ${delay}`);
-        console.log();
-
-    });
+HoldproxyCommand.main(process.argv.splice(2));

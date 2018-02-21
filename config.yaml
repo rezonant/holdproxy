@@ -1,5 +1,5 @@
 holdproxy:
-    port: 3001
-    upstream: 3000
-    maxAttempts: 10
-    delay: 5
+  port: 7777
+  upstream: 9999
+  maxAttempts: 10
+  delay: 5
